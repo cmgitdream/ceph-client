@@ -1686,6 +1686,8 @@ rbd_img_request_op_type(struct rbd_img_request *img_request)
 		return OBJ_OP_READ;
 }
 
+static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request);
+
 static void
 rbd_img_obj_request_read_callback(struct rbd_obj_request *obj_request)
 {
@@ -1752,8 +1754,10 @@ static void rbd_osd_read_callback(struct rbd_obj_request *obj_request)
 		obj_request, img_request, obj_request->result,
 		obj_request->xferred, obj_request->length);
 	if (layered && obj_request->result == -ENOENT &&
-			obj_request->img_offset < rbd_dev->parent_overlap)
+			obj_request->img_offset < rbd_dev->parent_overlap) {
 		rbd_img_parent_read(obj_request);
+		rbd_img_obj_parent_read_full(obj_request);
+	}
 	else if (img_request)
 		rbd_img_obj_request_read_callback(obj_request);
 	else
@@ -1950,31 +1954,41 @@ rbd_osd_req_create_copyup(struct rbd_obj_request *obj_request)
 	struct ceph_snap_context *snapc;
 	struct rbd_device *rbd_dev;
 	struct ceph_osd_client *osdc;
-	struct ceph_osd_request *osd_req;
+	struct ceph_osd_request *osd_req = NULL;
 	int num_osd_ops = 3;
 
 	rbd_assert(obj_request_img_data_test(obj_request));
 	img_request = obj_request->img_request;
 	rbd_assert(img_request);
-	rbd_assert(img_request_write_test(img_request) ||
-			img_request_discard_test(img_request));
-
-	if (img_request_discard_test(img_request))
-		num_osd_ops = 2;
-
-	/* Allocate and initialize the request, for all the ops */
 
 	snapc = img_request->snapc;
 	rbd_dev = img_request->rbd_dev;
+
+	if (img_request_discard_test(img_request)) {
+		num_osd_ops = 2;
+	}
+	else if(!img_request_write_test(img_request)) {
+		snapc = rbd_dev->header.snapc;
+		num_osd_ops = 1;
+	}
+
+	/* Allocate and initialize the request, for all the ops */
+
 	osdc = &rbd_dev->rbd_client->client->osdc;
 	osd_req = ceph_osdc_alloc_request(osdc, snapc, num_osd_ops,
-						false, GFP_ATOMIC);
+  						false, GFP_ATOMIC);
 	if (!osd_req)
 		return NULL;	/* ENOMEM */
-
 	osd_req->r_flags = CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK;
-	osd_req->r_callback = rbd_osd_req_callback;
-	osd_req->r_priv = obj_request;
+	if (img_request_write_test(img_request) || 
+		img_request_discard_test(img_request)) {
+		/* write or discard */
+	  	osd_req->r_callback = rbd_osd_req_callback;
+	  	osd_req->r_priv = obj_request;
+	} else { /* read */
+	  	osd_req->r_callback = NULL;
+		osd_req->r_priv = NULL;
+	}
 
 	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
 	ceph_oid_set_name(&osd_req->r_base_oid, obj_request->object_name);
@@ -2554,6 +2568,7 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	u32 page_count;
 	int img_result;
 	u64 parent_length;
+	bool is_read = false;
 
 	rbd_assert(img_request_child_test(img_request));
 
@@ -2577,6 +2592,9 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	rbd_assert(orig_request->img_request);
 	rbd_dev = orig_request->img_request->rbd_dev;
 	rbd_assert(rbd_dev);
+
+	is_read = !img_request_write_test(orig_request->img_request) && 
+			!img_request_discard_test(orig_request->img_request);
 
 	/*
 	 * If the overlap has become 0 (most likely because the
@@ -2606,7 +2624,8 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	osd_req = rbd_osd_req_create_copyup(orig_request);
 	if (!osd_req)
 		goto out_err;
-	rbd_osd_req_destroy(orig_request->osd_req);
+	if(orig_request->osd_req != NULL)	
+		rbd_osd_req_destroy(orig_request->osd_req);
 	orig_request->osd_req = osd_req;
 	orig_request->copyup_pages = pages;
 	orig_request->copyup_page_count = page_count;
@@ -2617,18 +2636,23 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	osd_req_op_cls_request_data_pages(osd_req, 0, pages, parent_length, 0,
 						false, false);
 
-	/* Add the other op(s) */
+	/* Add the other op(s) & encode osd_req data */
 
-	op_type = rbd_img_request_op_type(orig_request->img_request);
-	rbd_img_obj_request_fill(orig_request, osd_req, op_type, 1);
+	if (is_read) {
+		struct timespec mtime = CURRENT_TIME;
+		ceph_osdc_build_request(osd_req, 0, rbd_dev->header.snapc, CEPH_NOSNAP, &mtime);
+	} else {
+		op_type = rbd_img_request_op_type(orig_request->img_request);
+		rbd_img_obj_request_fill(orig_request, osd_req, op_type, 1);
+	}
 
 	/* All set, send it off. */
 
 	orig_request->callback = rbd_img_obj_copyup_callback;
 	osdc = &rbd_dev->rbd_client->client->osdc;
-	img_result = rbd_obj_request_submit(osdc, orig_request);
+	img_result = ceph_osdc_start_request(osdc, osd_req, false);
 	if (!img_result)
-		return;
+		goto out;
 out_err:
 	/* Record the error code and complete the request */
 
@@ -2636,6 +2660,10 @@ out_err:
 	orig_request->xferred = 0;
 	obj_request_done_set(orig_request);
 	rbd_obj_request_complete(orig_request);
+out:
+	//pr_info("%s: out\n", __func__);
+	if(is_read)
+		rbd_img_request_put(orig_request->img_request);
 }
 
 /*
@@ -2656,12 +2684,15 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 {
 	struct rbd_img_request *img_request = NULL;
 	struct rbd_img_request *parent_request = NULL;
+	struct rbd_obj_request *replica_obj_request = NULL;
+	struct rbd_obj_request *outgoing_obj_request = obj_request;
 	struct rbd_device *rbd_dev;
 	u64 img_offset;
 	u64 length;
 	struct page **pages = NULL;
 	u32 page_count;
 	int result;
+	bool is_read;
 
 	rbd_assert(obj_request_img_data_test(obj_request));
 	rbd_assert(obj_request_type_valid(obj_request->type));
@@ -2670,6 +2701,9 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 	rbd_assert(img_request != NULL);
 	rbd_dev = img_request->rbd_dev;
 	rbd_assert(rbd_dev->parent != NULL);
+
+	is_read = !img_request_write_test(img_request) &&
+			!img_request_discard_test(img_request);
 
 	/*
 	 * Determine the byte range covered by the object in the
@@ -2701,7 +2735,24 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 	}
 
 	result = -ENOMEM;
-	parent_request = rbd_parent_request_create(obj_request,
+
+	if (is_read) {
+		// Need an empty rbd_obj_request to pass object_name and img_request
+ 		replica_obj_request = rbd_obj_request_create(obj_request->object_name, 
+							0, 0, OBJ_REQUEST_PAGES);	
+		if(!replica_obj_request)
+			goto out_obj_err;
+		//rbd_obj_request_get(replica_obj_request);
+		replica_obj_request->img_request = obj_request->img_request;
+		obj_request_img_data_set(replica_obj_request);
+		replica_obj_request->pages = 0;
+		replica_obj_request->page_count = 0;
+		replica_obj_request->osd_req = NULL; 
+		rbd_img_request_get(img_request);
+		outgoing_obj_request = replica_obj_request;
+	}
+
+	parent_request = rbd_parent_request_create(outgoing_obj_request,
 						img_offset, length);
 	if (!parent_request)
 		goto out_err;
@@ -2729,7 +2780,7 @@ out_err:
 	obj_request->result = result;
 	obj_request->xferred = 0;
 	obj_request_done_set(obj_request);
-
+out_obj_err:
 	return result;
 }
 
@@ -2782,10 +2833,13 @@ static void rbd_img_obj_exists_callback(struct rbd_obj_request *obj_request)
 	 * error to the original request and complete it now.
 	 */
 	if (!result) {
+		//pr_info("object exists\n");
 		obj_request_existence_set(orig_request, true);
 	} else if (result == -ENOENT) {
+		//pr_info("object NOT exists\n");
 		obj_request_existence_set(orig_request, false);
 	} else if (result) {
+		pr_info("object error %d", result);
 		orig_request->result = result;
 		goto out;
 	}
@@ -2905,6 +2959,7 @@ static bool img_obj_request_simple(struct rbd_obj_request *obj_request)
 
 static int rbd_img_obj_request_submit(struct rbd_obj_request *obj_request)
 {
+	//pr_info("%s: %s [%d ~ %d]\n", __func__, obj_request->object_name, obj_request->offset, obj_request->length);
 	if (img_obj_request_simple(obj_request)) {
 		struct rbd_device *rbd_dev;
 		struct ceph_osd_client *osdc;
@@ -5694,9 +5749,9 @@ static int __init rbd_init(void)
 		goto err_out_blkdev;
 
 	if (single_major)
-		pr_info("loaded (major %d)\n", rbd_major);
+		pr_info("loaded by chenmin(major %d)\n", rbd_major);
 	else
-		pr_info("loaded\n");
+		pr_info("loaded by chenmin\n");
 
 	return 0;
 
