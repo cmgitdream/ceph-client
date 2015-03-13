@@ -207,6 +207,9 @@ typedef void (*rbd_img_callback_t)(struct rbd_img_request *);
 struct rbd_obj_request;
 typedef void (*rbd_obj_callback_t)(struct rbd_obj_request *);
 
+struct rbd_copyup_request;
+typedef void (*rbd_copyup_callback_t)(struct rbd_copyup_request *);
+
 enum obj_request_type {
 	OBJ_REQUEST_NODATA, OBJ_REQUEST_BIO, OBJ_REQUEST_PAGES
 };
@@ -279,6 +282,46 @@ struct rbd_obj_request {
 	struct kref		kref;
 };
 
+/* object copyup request state */
+enum copyup_req_flags {
+	COPYUP_REQ_UNDEF,
+	COPYUP_REQ_READING,
+	COPYUP_REQ_READ_FINISHED,
+	COPYUP_REQ_WRITING,
+	COPYUP_REQ_WRITE_FINISHED,
+	COPYUP_REQ_DONE
+};
+
+struct rbd_copyup_request {
+	const char *	object_name;
+	u64		object_no;
+	unsigned long	flags;
+
+	struct {
+		struct page 	**copyup_pages;
+		u32		copyup_page_count;
+	};
+
+	struct rbd_img_request *img_request;
+	/* links for img_request->copyup_requests list */
+	struct list_head	links; 
+	u32		which;
+
+	/* list for copy on write pending obj_request */
+	u32			pending_request_count;
+	struct list_head	pending_obj_requests;
+	
+	struct ceph_osd_request		*osd_req;
+
+	u64		xferred; /* we want the length of whole object: 1 << rbd_device->header.obj_order */
+	int		result;
+	
+	rbd_copyup_callback_t 	callback;
+	struct completion	completion;
+
+	struct kref	kref;
+};
+
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
 	IMG_REQ_CHILD,		/* initiator: block = 0, child image = 1 */
@@ -309,6 +352,10 @@ struct rbd_img_request {
 
 	u32			obj_request_count;
 	struct list_head	obj_requests;	/* rbd_obj_request structs */
+	
+	u32			copyup_count;	/* rbd_copyup_request counts */
+	struct list_head	copyup_list;	/* rbd_copyup_request list */
+	spinlock_t		copyup_list_lock; /* protects copyup list */
 
 	struct kref		kref;
 };
@@ -319,6 +366,9 @@ struct rbd_img_request {
 	list_for_each_entry_from(oreq, &(ireq)->obj_requests, links)
 #define for_each_obj_request_safe(ireq, oreq, n) \
 	list_for_each_entry_safe_reverse(oreq, n, &(ireq)->obj_requests, links)
+
+#define for_each_copyup_request(ireq, cpreq) \
+	list_for_each_entry(cpreq, &(ireq)->copyup_list, links)
 
 struct rbd_mapping {
 	u64                     size;
@@ -398,6 +448,7 @@ static DEFINE_SPINLOCK(rbd_client_list_lock);
 
 static struct kmem_cache	*rbd_img_request_cache;
 static struct kmem_cache	*rbd_obj_request_cache;
+static struct kmem_cache	*rbd_copyup_request_cache;
 static struct kmem_cache	*rbd_segment_name_cache;
 
 static int rbd_major;
@@ -1162,6 +1213,26 @@ static void rbd_dev_mapping_clear(struct rbd_device *rbd_dev)
 	rbd_dev->mapping.features = 0;
 }
 
+static u64 rbd_object_no(struct rbd_device *rbd_dev, const char *object_name)
+{
+	const char *ptr = NULL;
+	size_t len = 0;
+	u64 offset_width = 10;
+	u64 obj_no = (u64)-1;
+
+	rbd_assert(rbd_dev);
+	rbd_assert(object_name);
+
+	ptr = object_name;
+	len = strlen(object_name);
+	if (rbd_dev->image_format == 2)
+		offset_width = 16;	
+	rbd_assert(len >= offset_width);
+	ptr += len - offset_width;
+	obj_no = simple_strtoull(ptr, NULL, 16);
+	return obj_no;
+}
+
 static void rbd_segment_name_free(const char *name)
 {
 	/* The explicit cast here is needed to drop the const qualifier */
@@ -1478,6 +1549,24 @@ static void rbd_obj_request_put(struct rbd_obj_request *obj_request)
 	kref_put(&obj_request->kref, rbd_obj_request_destroy);
 }
 
+static void rbd_copyup_request_get(struct rbd_copyup_request *copyup_request)
+{
+	dout("%s: copyup %p (was %d)\n", __func__, copyup_request,
+	//pr_info("%s: copyup %p (was %d)\n", __func__, copyup_request,
+		atomic_read(&copyup_request->kref.refcount));
+	kref_get(&copyup_request->kref);
+}
+
+static void rbd_copyup_request_destroy(struct kref *kref);
+static void rbd_copyup_request_put(struct rbd_copyup_request *copyup_request)
+{
+	rbd_assert(copyup_request != NULL);
+	dout("%s: copyup %p (was %d)\n", __func__, copyup_request,
+	//pr_info("%s: copyup %p (was %d)\n", __func__, copyup_request,
+		atomic_read(&copyup_request->kref.refcount));
+	kref_put(&copyup_request->kref, rbd_copyup_request_destroy);
+}
+
 static void rbd_img_request_get(struct rbd_img_request *img_request)
 {
 	dout("%s: img %p (was %d)\n", __func__, img_request,
@@ -1533,6 +1622,38 @@ static inline void rbd_img_obj_request_del(struct rbd_img_request *img_request,
 	obj_request->img_request = NULL;
 	obj_request->callback = NULL;
 	rbd_obj_request_put(obj_request);
+}
+
+static inline void rbd_img_copyup_request_add(struct rbd_img_request *img_request,
+					struct rbd_copyup_request *copyup_request)
+{
+	rbd_assert(copyup_request->img_request == NULL)
+	
+	copyup_request->img_request = img_request;
+	copyup_request->which = img_request->copyup_count;
+	
+	img_request->copyup_count++;
+	/* 
+	* For object locality, when search an object in copyup_list, 
+	* the new request always belongs to the last inserted object,
+	* so, just insert copyup_request after head
+	*/
+	list_add(&copyup_request->links, &img_request->copyup_list);
+}
+
+static inline void rbd_img_copyup_request_del(struct rbd_img_request *img_request,
+					struct rbd_copyup_request *copyup_request)
+{
+	rbd_assert(copyup_request->which != BAD_WHICH);
+	
+	list_del(&copyup_request->links);
+	rbd_assert(img_request->copyup_count > 0);
+	img_request->copyup_count--;
+	rbd_assert(copyup_request->which == img_request->copyup_count);
+	rbd_assert(copyup_request->img_request == img_request);
+	copyup_request->img_request = NULL;
+	copyup_request->callback = NULL;
+	rbd_copyup_request_put(copyup_request);
 }
 
 static bool obj_request_type_valid(enum obj_request_type type)
@@ -1687,6 +1808,7 @@ rbd_img_request_op_type(struct rbd_img_request *img_request)
 }
 
 static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request);
+static void rbd_img_copyup_start(struct rbd_img_request *img_request, const char *object_name);
 
 static void
 rbd_img_obj_request_read_callback(struct rbd_obj_request *obj_request)
@@ -1756,7 +1878,7 @@ static void rbd_osd_read_callback(struct rbd_obj_request *obj_request)
 	if (layered && obj_request->result == -ENOENT &&
 			obj_request->img_offset < rbd_dev->parent_overlap) {
 		rbd_img_parent_read(obj_request);
-		rbd_img_obj_parent_read_full(obj_request);
+		rbd_img_copyup_start(obj_request->img_request, obj_request->object_name);
 	}
 	else if (img_request)
 		rbd_img_obj_request_read_callback(obj_request);
@@ -1954,41 +2076,31 @@ rbd_osd_req_create_copyup(struct rbd_obj_request *obj_request)
 	struct ceph_snap_context *snapc;
 	struct rbd_device *rbd_dev;
 	struct ceph_osd_client *osdc;
-	struct ceph_osd_request *osd_req = NULL;
+	struct ceph_osd_request *osd_req;
 	int num_osd_ops = 3;
 
 	rbd_assert(obj_request_img_data_test(obj_request));
 	img_request = obj_request->img_request;
 	rbd_assert(img_request);
+	rbd_assert(img_request_write_test(img_request) ||
+			img_request_discard_test(img_request));
 
-	snapc = img_request->snapc;
-	rbd_dev = img_request->rbd_dev;
-
-	if (img_request_discard_test(img_request)) {
+	if (img_request_discard_test(img_request))
 		num_osd_ops = 2;
-	}
-	else if(!img_request_write_test(img_request)) {
-		snapc = rbd_dev->header.snapc;
-		num_osd_ops = 1;
-	}
 
 	/* Allocate and initialize the request, for all the ops */
 
+	snapc = img_request->snapc;
+	rbd_dev = img_request->rbd_dev;
 	osdc = &rbd_dev->rbd_client->client->osdc;
 	osd_req = ceph_osdc_alloc_request(osdc, snapc, num_osd_ops,
-  						false, GFP_ATOMIC);
+						false, GFP_ATOMIC);
 	if (!osd_req)
 		return NULL;	/* ENOMEM */
+
 	osd_req->r_flags = CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK;
-	if (img_request_write_test(img_request) || 
-		img_request_discard_test(img_request)) {
-		/* write or discard */
-	  	osd_req->r_callback = rbd_osd_req_callback;
-	  	osd_req->r_priv = obj_request;
-	} else { /* read */
-	  	osd_req->r_callback = NULL;
-		osd_req->r_priv = NULL;
-	}
+	osd_req->r_callback = rbd_osd_req_callback;
+	osd_req->r_priv = obj_request;
 
 	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
 	ceph_oid_set_name(&osd_req->r_base_oid, obj_request->object_name);
@@ -2073,6 +2185,101 @@ static void rbd_obj_request_destroy(struct kref *kref)
 	kfree(obj_request->object_name);
 	obj_request->object_name = NULL;
 	kmem_cache_free(rbd_obj_request_cache, obj_request);
+}
+
+static struct rbd_copyup_request *rbd_copyup_request_create(const char *object_name, 
+						struct rbd_device *rbd_dev)
+{
+	struct rbd_copyup_request *copyup_request = NULL;
+	size_t size = 0;	
+	u64 length = 0;
+	char *name = NULL;
+	struct page **pages = NULL;
+	u32	page_count = 0;
+	
+	rbd_assert(rbd_dev);
+	rbd_assert(object_name);
+
+	/* Allocate memory for object_name */
+	size = strlen(object_name) + 1;
+	name = kmalloc(size, GFP_KERNEL);
+	if(!name)
+		goto out_name;
+
+	/* Allocate memory for entire object */
+	length = (u64)1 << rbd_dev->header.obj_order;
+	page_count = (u32)calc_pages_for(0,length);
+	pages = ceph_alloc_page_vector(page_count, GFP_KERNEL);	
+	if (IS_ERR(pages)) 	
+		goto out_pages;
+
+	/* Allocate memory for struct rbd_copyup_request */
+	copyup_request = kmem_cache_zalloc(rbd_copyup_request_cache, GFP_KERNEL);
+	if(!copyup_request) 
+		goto out_request;
+
+	/* Init all members of struct rbd_copyup_request */
+	copyup_request->object_name = memcpy(name, object_name, size);
+	copyup_request->object_no = rbd_object_no(rbd_dev, object_name);
+	copyup_request->flags = COPYUP_REQ_UNDEF;
+	copyup_request->copyup_pages = pages;
+	copyup_request->copyup_page_count = page_count;
+
+	copyup_request->img_request = NULL;	
+	INIT_LIST_HEAD(&copyup_request->links);
+	copyup_request->which = BAD_WHICH;
+	copyup_request->pending_request_count = 0;
+	INIT_LIST_HEAD(&copyup_request->pending_obj_requests);
+
+	copyup_request->osd_req = NULL;
+	copyup_request->xferred = 0;
+	copyup_request->result = 0;
+	copyup_request->callback = NULL;
+	init_completion(&copyup_request->completion);
+
+	kref_init(&copyup_request->kref);
+
+	return copyup_request;
+out_request:
+	if (copyup_request) {
+		kmem_cache_free(rbd_copyup_request_cache, copyup_request);
+		copyup_request = NULL;
+	}
+out_pages:
+	if (pages) {
+		ceph_release_page_vector(pages, page_count);
+		pages = NULL;	
+		page_count = 0;
+	}
+out_name:
+	if (name) {
+		kfree(name);
+		name = NULL;
+	}	
+	return NULL;
+}
+
+static void rbd_copyup_request_destroy(struct kref *kref)
+{
+	struct rbd_copyup_request *copyup_request;
+	copyup_request = container_of(kref, struct rbd_copyup_request, kref);
+	
+	//rbd_assert(copyup_request->which == BAD_WHICH)	
+	if (copyup_request->osd_req) {
+		rbd_osd_req_destroy(copyup_request->osd_req);		
+		copyup_request->osd_req = NULL;
+	}
+	
+	if (copyup_request->copyup_pages) {
+		ceph_release_page_vector(copyup_request->copyup_pages, copyup_request->copyup_page_count);
+		copyup_request->copyup_pages = NULL;
+	}
+
+	if (copyup_request->object_name) {
+		kfree(copyup_request->object_name);
+		copyup_request->object_name = NULL;
+	}
+	kmem_cache_free(rbd_copyup_request_cache, copyup_request);
 }
 
 /* It's OK to call this for a device with no parent */
@@ -2176,6 +2383,9 @@ static struct rbd_img_request *rbd_img_request_create(
 	img_request->result = 0;
 	img_request->obj_request_count = 0;
 	INIT_LIST_HEAD(&img_request->obj_requests);
+	img_request->copyup_count = 0;
+	INIT_LIST_HEAD(&img_request->copyup_list);
+	spin_lock_init(&img_request->copyup_list_lock);
 	kref_init(&img_request->kref);
 
 	dout("%s: rbd_dev %p %s %llu/%llu -> img %p\n", __func__, rbd_dev,
@@ -2568,7 +2778,6 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	u32 page_count;
 	int img_result;
 	u64 parent_length;
-	bool is_read = false;
 
 	rbd_assert(img_request_child_test(img_request));
 
@@ -2592,9 +2801,6 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	rbd_assert(orig_request->img_request);
 	rbd_dev = orig_request->img_request->rbd_dev;
 	rbd_assert(rbd_dev);
-
-	is_read = !img_request_write_test(orig_request->img_request) && 
-			!img_request_discard_test(orig_request->img_request);
 
 	/*
 	 * If the overlap has become 0 (most likely because the
@@ -2624,8 +2830,7 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	osd_req = rbd_osd_req_create_copyup(orig_request);
 	if (!osd_req)
 		goto out_err;
-	if(orig_request->osd_req != NULL)	
-		rbd_osd_req_destroy(orig_request->osd_req);
+	rbd_osd_req_destroy(orig_request->osd_req);
 	orig_request->osd_req = osd_req;
 	orig_request->copyup_pages = pages;
 	orig_request->copyup_page_count = page_count;
@@ -2636,23 +2841,18 @@ rbd_img_obj_parent_read_full_callback(struct rbd_img_request *img_request)
 	osd_req_op_cls_request_data_pages(osd_req, 0, pages, parent_length, 0,
 						false, false);
 
-	/* Add the other op(s) & encode osd_req data */
+	/* Add the other op(s) */
 
-	if (is_read) {
-		struct timespec mtime = CURRENT_TIME;
-		ceph_osdc_build_request(osd_req, 0, rbd_dev->header.snapc, CEPH_NOSNAP, &mtime);
-	} else {
-		op_type = rbd_img_request_op_type(orig_request->img_request);
-		rbd_img_obj_request_fill(orig_request, osd_req, op_type, 1);
-	}
+	op_type = rbd_img_request_op_type(orig_request->img_request);
+	rbd_img_obj_request_fill(orig_request, osd_req, op_type, 1);
 
 	/* All set, send it off. */
 
 	orig_request->callback = rbd_img_obj_copyup_callback;
 	osdc = &rbd_dev->rbd_client->client->osdc;
-	img_result = ceph_osdc_start_request(osdc, osd_req, false);
+	img_result = rbd_obj_request_submit(osdc, orig_request);
 	if (!img_result)
-		goto out;
+		return;
 out_err:
 	/* Record the error code and complete the request */
 
@@ -2660,10 +2860,6 @@ out_err:
 	orig_request->xferred = 0;
 	obj_request_done_set(orig_request);
 	rbd_obj_request_complete(orig_request);
-out:
-	//pr_info("%s: out\n", __func__);
-	if(is_read)
-		rbd_img_request_put(orig_request->img_request);
 }
 
 /*
@@ -2692,7 +2888,6 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 	struct page **pages = NULL;
 	u32 page_count;
 	int result;
-	bool is_read;
 
 	rbd_assert(obj_request_img_data_test(obj_request));
 	rbd_assert(obj_request_type_valid(obj_request->type));
@@ -2701,9 +2896,6 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 	rbd_assert(img_request != NULL);
 	rbd_dev = img_request->rbd_dev;
 	rbd_assert(rbd_dev->parent != NULL);
-
-	is_read = !img_request_write_test(img_request) &&
-			!img_request_discard_test(img_request);
 
 	/*
 	 * Determine the byte range covered by the object in the
@@ -2735,24 +2927,7 @@ static int rbd_img_obj_parent_read_full(struct rbd_obj_request *obj_request)
 	}
 
 	result = -ENOMEM;
-
-	if (is_read) {
-		// Need an empty rbd_obj_request to pass object_name and img_request
- 		replica_obj_request = rbd_obj_request_create(obj_request->object_name, 
-							0, 0, OBJ_REQUEST_PAGES);	
-		if(!replica_obj_request)
-			goto out_obj_err;
-		//rbd_obj_request_get(replica_obj_request);
-		replica_obj_request->img_request = obj_request->img_request;
-		obj_request_img_data_set(replica_obj_request);
-		replica_obj_request->pages = 0;
-		replica_obj_request->page_count = 0;
-		replica_obj_request->osd_req = NULL; 
-		rbd_img_request_get(img_request);
-		outgoing_obj_request = replica_obj_request;
-	}
-
-	parent_request = rbd_parent_request_create(outgoing_obj_request,
+	parent_request = rbd_parent_request_create(obj_request,
 						img_offset, length);
 	if (!parent_request)
 		goto out_err;
@@ -2780,9 +2955,190 @@ out_err:
 	obj_request->result = result;
 	obj_request->xferred = 0;
 	obj_request_done_set(obj_request);
-out_obj_err:
+
 	return result;
 }
+
+static void rbd_img_copyup_end(struct rbd_copyup_request *copyup_request)
+{
+	struct rbd_img_request *img_request = NULL;
+	//pr_info("%s\n", __func__);
+	rbd_assert(copyup_request);
+	img_request = copyup_request->img_request;	
+	rbd_img_copyup_request_del(img_request, copyup_request);	
+	rbd_img_request_put(img_request);
+}
+
+static void rbd_osd_req_copyup_callback(struct ceph_osd_request *osd_req, 
+					struct ceph_msg *msg)
+{
+	struct rbd_copyup_request *copyup_request = NULL;
+	rbd_assert(osd_req);
+	//pr_info("%s: oid:%s, osd_req->result = %d\n", __func__, osd_req->r_base_oid.name, osd_req->r_result);
+	copyup_request = osd_req->r_priv;
+	if(copyup_request->callback)
+		copyup_request->callback(copyup_request);	
+	else
+		complete_all(&copyup_request->completion);
+}
+
+static void rbd_img_copyup_write_async(struct rbd_copyup_request *copyup_request)
+{
+	struct rbd_img_request *img_request = NULL;
+	struct ceph_snap_context *snapc = NULL;
+	struct ceph_osd_request *osd_req = NULL;	
+	struct ceph_osd_client *osdc = NULL;
+	struct rbd_device *rbd_dev = NULL;
+	struct page **pages = NULL;
+	struct timespec mtime = CURRENT_TIME;
+	u32 page_count = 0;
+	u64 object_size = 0;
+	int result = 0;
+
+	img_request = copyup_request->img_request;
+	rbd_assert(img_request);
+	rbd_dev = img_request->rbd_dev;
+	rbd_assert(rbd_dev);
+	osdc = &rbd_dev->rbd_client->client->osdc;
+	rbd_assert(osdc);
+	snapc = rbd_dev->header.snapc;
+
+	ceph_osdc_put_request(copyup_request->osd_req);
+
+	copyup_request->osd_req = NULL;
+	osd_req = ceph_osdc_alloc_request(osdc, snapc, 1, false, GFP_ATOMIC);
+	if (!osd_req)
+		goto out;	
+	
+	pages = copyup_request->copyup_pages;
+	page_count = copyup_request->copyup_page_count;
+	object_size = (u64)1 << rbd_dev->header.obj_order;
+
+	/* Initialize copyup op */
+	osd_req_op_cls_init(osd_req, 0, CEPH_OSD_OP_CALL, "rbd", "copyup");
+	osd_req_op_cls_request_data_pages(osd_req, 0, pages, object_size, 0, false, false);
+	osd_req->r_flags = CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK;
+	osd_req->r_callback = rbd_osd_req_copyup_callback;
+	osd_req->r_priv = copyup_request;
+	
+	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+	ceph_oid_set_name(&osd_req->r_base_oid, copyup_request->object_name);
+	
+	copyup_request->osd_req = osd_req;
+	copyup_request->callback = rbd_img_copyup_end;
+
+	ceph_osdc_build_request(osd_req, 0, snapc, CEPH_NOSNAP, &mtime);		
+	result = ceph_osdc_start_request(osdc, osd_req, false);
+	if(!result)
+		goto out;
+
+	ceph_osdc_put_request(osd_req);
+out:
+	return;
+}
+
+static void rbd_img_copyup_start(struct rbd_img_request *img_request,
+				const char *object_name) 
+{
+	struct rbd_copyup_request *copyup_request = NULL;
+	struct rbd_device *rbd_dev = NULL;
+	struct ceph_snap_context *snapc = NULL;
+	struct ceph_osd_client *osdc = NULL;
+	struct ceph_osd_request *osd_req = NULL;
+	const char *parent_object_name = NULL;
+	int result = 0;
+	u64 object_no = (u64)-1;
+	u64 object_size = 0;
+	u64 snap_id = 0;
+	__u8 obj_order = 0;
+	bool found = false;
+	bool is_read = false;
+
+	rbd_assert(img_request != NULL);	
+	rbd_assert(object_name != NULL);	
+
+	rbd_img_request_get(img_request);
+	
+	rbd_dev = img_request->rbd_dev;
+	rbd_assert(rbd_dev != NULL);	
+
+	is_read = !img_request_write_test(img_request) && 
+			!img_request_discard_test(img_request);
+
+	object_no = rbd_object_no(rbd_dev, object_name);
+	obj_order = rbd_dev->header.obj_order;
+	object_size = (u64)1 << obj_order;
+	spin_lock_irq(&img_request->copyup_list_lock);
+	
+	/* Find if object_no exists in copyup_list */
+	for_each_copyup_request(img_request, copyup_request) {
+		if(!copyup_request)
+			break;
+		if(copyup_request->object_no == object_no) {
+			found = true;
+			break;
+		}
+	}
+
+	/* Founded, just return */
+	if (found) {
+		//pr_info("founded %s\n", object_name);
+		if (is_read)
+			goto out;	
+	}
+
+	//pr_info("NOT founded %s\n", object_name);
+	/* Not founded, send new copyup request */
+
+	copyup_request = NULL;
+	osdc = &rbd_dev->rbd_client->client->osdc;	
+	parent_object_name = rbd_segment_name(rbd_dev->parent, object_no << obj_order);
+	if (!parent_object_name)
+		goto out;
+	osd_req = ceph_osdc_alloc_request(osdc, snapc, 1, false, GFP_ATOMIC);	
+	if (!osd_req)
+		goto out;
+	copyup_request = rbd_copyup_request_create(object_name, rbd_dev);	
+	if (!copyup_request) {
+		ceph_osdc_put_request(osd_req);
+		goto out;
+	}
+
+	/* Init osd_req */	
+	osd_req_op_extent_init(osd_req, 0, CEPH_OSD_OP_READ, 0, object_size, 0, 0);
+	osd_req_op_extent_osd_data_pages(osd_req, 0, copyup_request->copyup_pages, object_size,
+					0, false, false);
+
+	osd_req->r_flags = CEPH_OSD_FLAG_READ;
+	osd_req->r_callback = rbd_osd_req_copyup_callback;
+	osd_req->r_priv = copyup_request;
+
+	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->parent->layout);
+	ceph_oid_set_name(&osd_req->r_base_oid, parent_object_name);
+	rbd_segment_name_free(parent_object_name);
+	
+	/* Init copyup request */
+	rbd_assert(copyup_request->osd_req == NULL);
+	copyup_request->osd_req = osd_req;
+	copyup_request->callback = rbd_img_copyup_write_async;
+
+	/* Encode osd_req data */
+	snap_id = img_request ? img_request->snap_id : CEPH_NOSNAP;
+	ceph_osdc_build_request(osd_req, 0, NULL, snap_id, NULL);
+
+	/* Add copyup request to img_request->copyup_list */
+	rbd_img_copyup_request_add(img_request, copyup_request);
+
+	/* Send osd_req */
+	result = ceph_osdc_start_request(osdc, osd_req, false);
+	if (!result)
+		goto out;
+	
+	rbd_copyup_request_put(copyup_request);
+out:
+	spin_unlock_irq(&img_request->copyup_list_lock);	
+}
+
 
 static void rbd_img_obj_exists_callback(struct rbd_obj_request *obj_request)
 {
@@ -2833,13 +3189,10 @@ static void rbd_img_obj_exists_callback(struct rbd_obj_request *obj_request)
 	 * error to the original request and complete it now.
 	 */
 	if (!result) {
-		//pr_info("object exists\n");
 		obj_request_existence_set(orig_request, true);
 	} else if (result == -ENOENT) {
-		//pr_info("object NOT exists\n");
 		obj_request_existence_set(orig_request, false);
 	} else if (result) {
-		pr_info("object error %d", result);
 		orig_request->result = result;
 		goto out;
 	}
@@ -2959,7 +3312,6 @@ static bool img_obj_request_simple(struct rbd_obj_request *obj_request)
 
 static int rbd_img_obj_request_submit(struct rbd_obj_request *obj_request)
 {
-	//pr_info("%s: %s [%d ~ %d]\n", __func__, obj_request->object_name, obj_request->offset, obj_request->length);
 	if (img_obj_request_simple(obj_request)) {
 		struct rbd_device *rbd_dev;
 		struct ceph_osd_client *osdc;
@@ -5681,6 +6033,14 @@ static int rbd_slab_init(void)
 	if (!rbd_obj_request_cache)
 		goto out_err;
 
+	rbd_assert(!rbd_copyup_request_cache);
+	rbd_copyup_request_cache = kmem_cache_create("rbd_copyup_request",
+					sizeof (struct rbd_copyup_request),
+					__alignof__(struct rbd_copyup_request),
+					0, NULL);
+	if (!rbd_copyup_request_cache)
+		goto out_err;
+
 	rbd_assert(!rbd_segment_name_cache);
 	rbd_segment_name_cache = kmem_cache_create("rbd_segment_name",
 					CEPH_MAX_OID_NAME_LEN + 1, 1, 0, NULL);
@@ -5690,6 +6050,11 @@ out_err:
 	if (rbd_obj_request_cache) {
 		kmem_cache_destroy(rbd_obj_request_cache);
 		rbd_obj_request_cache = NULL;
+	}
+
+	if (rbd_copyup_request_cache) {
+		kmem_cache_destroy(rbd_copyup_request_cache);
+		rbd_copyup_request_cache = NULL;
 	}
 
 	kmem_cache_destroy(rbd_img_request_cache);
@@ -5707,6 +6072,10 @@ static void rbd_slab_exit(void)
 	rbd_assert(rbd_obj_request_cache);
 	kmem_cache_destroy(rbd_obj_request_cache);
 	rbd_obj_request_cache = NULL;
+
+	rbd_assert(rbd_copyup_request_cache);
+	kmem_cache_destroy(rbd_copyup_request_cache);
+	rbd_copyup_request_cache = NULL;
 
 	rbd_assert(rbd_img_request_cache);
 	kmem_cache_destroy(rbd_img_request_cache);
